@@ -166,9 +166,10 @@ export function useChatPage() {
   const [searchParams] = useSearchParams();
   const routeSession = useMemo(() => parseChatRouteParams(params), [params]);
   const { health, models } = useAppContext();
-  const { user, activeOrg } = useAuth();
+  const { user, activeOrg, isLoading: authLoading } = useAuth();
   const canManageInstallSettings = user?.isPlatformAdmin === true;
   const {
+    orgId: profileOrgId,
     profileId: storeProfileId,
     setProfileId,
     syncForOrg,
@@ -178,13 +179,26 @@ export function useChatPage() {
     () => profilesQuery.data ?? [],
     [profilesQuery.data]
   );
-  const profileId =
+  const activeOrgId = activeOrg?.id ?? null;
+  const resolvedProfileId =
     storeProfileId ??
     readInitialDraftChatProfileId({
       orgId: activeOrg?.id,
       routeProfileId: parseChatRouteParams(params)?.profileId,
       search: location.search,
     });
+  const profileScopeReady =
+    !authLoading &&
+    (activeOrgId === null ||
+      (profileOrgId === activeOrgId &&
+        profilesQuery.isSuccess &&
+        profilesQuery.data !== undefined));
+  const profileId = profileScopeReady ? resolvedProfileId : "";
+  const scopedProfileId = profileId;
+  const routeProfileInScope =
+    routeSession === null ||
+    activeOrgId === null ||
+    profiles.some((profile) => profile.id === routeSession.profileId);
   const [session, setSession] = useState<RemoteChatSession | null>(null);
   const [cognito, setCognito] = useState(false);
   const [sessionModel, setSessionModel] = useState<string | null>(null);
@@ -208,8 +222,8 @@ export function useChatPage() {
   const [error, setError] = useState<string | null>(null);
   const { composerDraftKey, composerEntry, setComposerEntry } =
     useChatComposerDraft({
-      orgId: activeOrg?.id,
-      profileId,
+      orgId: activeOrgId ?? undefined,
+      profileId: scopedProfileId,
       routeSession,
       search: location.search,
       userId: user?.id,
@@ -231,6 +245,13 @@ export function useChatPage() {
   // Read inside sendMessage, which is memoised on other deps.
   const cognitoRef = useRef(cognito);
   const sessionLoadRef = useRef(0);
+  const profileScopeReadyRef = useRef(profileScopeReady);
+  const activeOrgIdRef = useRef(activeOrgId);
+
+  useEffect(() => {
+    profileScopeReadyRef.current = profileScopeReady;
+  }, [profileScopeReady]);
+
 
   /**
    * Hand the current stream back before the page moves to another chat.
@@ -263,6 +284,36 @@ export function useChatPage() {
     setCanStop(false);
     setTurnStartedAt(null);
   }, []);
+  useLayoutEffect(() => {
+    const previousOrgId = activeOrgIdRef.current;
+    if (previousOrgId === activeOrgId) {
+      return;
+    }
+    activeOrgIdRef.current = activeOrgId;
+    sessionLoadRef.current += 1;
+    loadedRouteRef.current = null;
+    releaseActiveStream();
+    isSendingRef.current = false;
+    messageQueueRef.current = [];
+    activeSessionIdRef.current = null;
+    setBusy(false);
+    setCanStop(false);
+    setTurnStartedAt(null);
+    setQueuedMessages([]);
+    setSession(null);
+    setSessionChannel("web");
+    setSessionModel(null);
+    setMessages([]);
+    setError(null);
+    setAgentTodos([]);
+    setAgentQuestionnaire(null);
+    setContextUsage(null);
+    setLastSuccessfulTurnAt(null);
+    setBranchingMessageId(null);
+    if (previousOrgId !== null && activeOrgId !== null) {
+      navigate(buildChatBasePath(), { replace: true });
+    }
+  }, [activeOrgId, navigate, releaseActiveStream]);
 
   useEffect(() => {
     cognitoRef.current = cognito;
@@ -309,11 +360,11 @@ export function useChatPage() {
     useThinkingSettings();
   const saveThinkingSettingsMutation = useSaveThinkingSettings();
   const thinkingAutoEnableRef = useRef(false);
-  const activeProfileQuery = useProfileQuery(profileId || null);
+  const activeProfileQuery = useProfileQuery(scopedProfileId || null);
 
   const activeProfile = useMemo(
-    () => profiles.find((profile) => profile.id === profileId),
-    [profiles, profileId]
+    () => profiles.find((profile) => profile.id === scopedProfileId),
+    [profiles, scopedProfileId]
   );
   const availableSkills = activeProfileQuery.data?.skills ?? [];
 
@@ -506,6 +557,9 @@ export function useChatPage() {
   );
 
   useEffect(() => {
+    if (!profileScopeReady) {
+      return;
+    }
     if (
       !(
         canManageInstallSettings &&
@@ -536,7 +590,10 @@ export function useChatPage() {
         if (cancelled) {
           return;
         }
-        if (profileIdRef.current !== startedProfileId) {
+        if (
+          !profileScopeReadyRef.current ||
+          profileIdRef.current !== startedProfileId
+        ) {
           return;
         }
         if (busyRef.current || routeSession) {
@@ -559,6 +616,7 @@ export function useChatPage() {
       cancelled = true;
     };
   }, [
+    profileScopeReady,
     thinkingSettings,
     canManageInstallSettings,
     activeModelSupportsThinking,
@@ -573,6 +631,9 @@ export function useChatPage() {
 
   const resumeSession = useCallback(
     async (nextProfileId: string, sessionId: string) => {
+      if (!profileScopeReadyRef.current) {
+        return;
+      }
       const loadId = ++sessionLoadRef.current;
       const isCurrentLoad = () => sessionLoadRef.current === loadId;
       releaseActiveStream();
@@ -849,15 +910,18 @@ export function useChatPage() {
     if (!profileId || routeSession) {
       return;
     }
+    if (!profileScopeReady) {
+      return;
+    }
     if (skipNextProfileSessionRef.current) {
       skipNextProfileSessionRef.current = false;
       return;
     }
     enterDraftChat(profileId);
-  }, [profileId, routeSession, enterDraftChat]);
+  }, [profileId, profileScopeReady, routeSession, enterDraftChat]);
 
   useEffect(() => {
-    if (!routeSession) {
+    if (!routeSession || !profileScopeReady || !routeProfileInScope) {
       return;
     }
     const routeKey = `${routeSession.profileId}:${routeSession.sessionId}`;
@@ -867,7 +931,7 @@ export function useChatPage() {
     loadedRouteRef.current = routeKey;
     skipNextProfileSessionRef.current = true;
     void resumeSession(routeSession.profileId, routeSession.sessionId);
-  }, [routeSession, resumeSession]);
+  }, [routeSession, routeProfileInScope, profileScopeReady, resumeSession]);
 
   useEffect(() => {
     if (profilesQuery.error) {
@@ -878,8 +942,15 @@ export function useChatPage() {
     if (!list || list.length === 0) {
       return;
     }
+    if (
+      activeOrgId !== null &&
+      profileOrgId !== activeOrgId &&
+      profilesQuery.isFetching
+    ) {
+      return;
+    }
     const resolved = syncForOrg({
-      orgId: activeOrg?.id ?? null,
+      orgId: activeOrgId,
       preferredProfileId: routeSession?.profileId,
       profiles: list,
     });
@@ -887,9 +958,11 @@ export function useChatPage() {
       enterDraftChat(resolved);
     }
   }, [
+    activeOrgId,
+    profileOrgId,
     profilesQuery.data,
     profilesQuery.error,
-    activeOrg?.id,
+    profilesQuery.isFetching,
     enterDraftChat,
     routeSession,
     syncForOrg,
